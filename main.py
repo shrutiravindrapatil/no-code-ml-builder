@@ -56,7 +56,8 @@ def save_dataframe(file_id: str, df: pd.DataFrame):
 class ProcessRequest(BaseModel):
     file_id: str
     numeric_columns: List[str]
-    scaler_type: str  # "standard" or "minmax"
+    scaler_type: str  # "standard", "minmax", or "none"
+    encoding_type: Optional[str] = "none" # "label" or "none"
 
 class SplitRequest(BaseModel):
     file_id: str
@@ -94,6 +95,7 @@ async def upload_file(file: UploadFile = File(...)):
         
         file_id = str(uuid.uuid4())
         save_dataframe(file_id, df)
+        save_dataframe(f"{file_id}_original", df.copy())
         
         preview = df.head(5).to_dict(orient="records")
         columns = df.columns.tolist()
@@ -114,28 +116,62 @@ async def upload_file(file: UploadFile = File(...)):
 
 @app.post("/api/preprocess")
 def preprocess_data(request: ProcessRequest):
-    df = get_dataframe(request.file_id)
+    # Try to load the original data to ensure we don't apply scaling on top of already scaled data
+    # (Enables toggling between methods)
+    df = get_dataframe(f"{request.file_id}_original")
+    if df is None:
+         # Fallback for older existing sessions or safety
+         df = get_dataframe(request.file_id)
+         
     if df is None:
         raise HTTPException(status_code=404, detail="File not found")
     
     df = df.copy()
     
     try:
+        # 1. Handle Encoding (Convert Words to Numbers)
+        if request.encoding_type == "label":
+            # Identify columns that are object/category type
+            # We only convert the ones that are in 'numeric_columns' (selected columns) or ALL?
+            # User expectation: "if dataset consist any categorial data"
+            # It's safer to convert all categorical data in the dataframe to ensure they are usable
+            obj_cols = df.select_dtypes(include=['object', 'category']).columns
+            for col in obj_cols:
+                # Use factorize which is simple label encoding
+                codes, _ = pd.factorize(df[col])
+                df[col] = codes
+
+        # 2. Handle Scaling
         scaler = None
         if request.scaler_type == "standard":
             scaler = StandardScaler()
         elif request.scaler_type == "minmax":
             scaler = MinMaxScaler()
+        elif request.scaler_type == "none":
+            scaler = None
         
         if scaler and request.numeric_columns:
-            df[request.numeric_columns] = scaler.fit_transform(df[request.numeric_columns])
+            # We should only scale columns that are actually numeric.
+            # If encoding happened, more columns might be numeric now.
+            # But we only want to scale the columns the user SELECTED (request.numeric_columns).
+            
+            # Filter selected columns for those that are actually numeric in the DF
+            # (If encoding was skipped, string cols will be skipped here)
+            valid_cols = [c for c in request.numeric_columns if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+            
+            if valid_cols:
+                df[valid_cols] = scaler.fit_transform(df[valid_cols])
         
-        # Update store (or we could create a new version to allow undo)
+        # Update store (overwrites the current working copy)
         save_dataframe(request.file_id, df)
         
+        # Recalculate which columns are numeric now, to send back to frontend
+        current_numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
         return {
             "message": f"Applied {request.scaler_type} scaling to {len(request.numeric_columns)} columns",
-            "preview": df.head(5).to_dict(orient="records")
+            "preview": df.head(5).to_dict(orient="records"),
+            "numeric_columns": current_numeric_cols # Send back updated list
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Preprocessing error: {str(e)}")
@@ -199,6 +235,7 @@ def train_model(request: TrainRequest):
         raise HTTPException(status_code=404, detail="File not found")
     
     # Selection of features
+    # Selection of features
     if request.selected_columns:
         # Use only columns the user explicitly chose
         X = df[request.selected_columns]
@@ -210,6 +247,24 @@ def train_model(request: TrainRequest):
     
     # Fill NaNs for robustness
     X = X.fillna(0)
+    
+    # Handling Categorical Data based on Model Type
+    encoders = {}
+    cat_columns = X.select_dtypes(include=['object', 'category']).columns
+    
+    if request.model_type == "logistic":
+        if len(cat_columns) > 0:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Logistic Regression cannot handle text data in columns: {list(cat_columns)}. Please go back to Preprocessing and choose 'Convert Words to Numbers'."
+            )
+            
+    elif request.model_type == "decision_tree":
+        # Auto-encode categorical columns for Decision Tree
+        for col in cat_columns:
+            codes, uniques = pd.factorize(X[col])
+            X[col] = codes
+            encoders[col] = uniques.tolist()
     
     # Check if we have enough data
     if len(X) < 10:
@@ -235,7 +290,8 @@ def train_model(request: TrainRequest):
         MODEL_STORE[request.file_id] = {
             "model": model,
             "features": X.columns.tolist(),
-            "target": request.target_column
+            "target": request.target_column,
+            "encoders": encoders 
         }
         
         y_pred = model.predict(X_test)
@@ -280,11 +336,32 @@ def predict_result(request: PredictRequest):
     stored = MODEL_STORE[request.file_id]
     model = stored["model"]
     features = stored["features"]
+    encoders = stored.get("encoders", {}) # Get encoders if they exist
     
     try:
         # Prepare input data in the correct order
-        input_data = [float(request.inputs.get(f, 0)) for f in features]
-        prediction = model.predict([input_data])[0]
+        input_list = []
+        for f in features:
+            val = request.inputs.get(f, 0)
+            
+            # If this feature has an encoder, we expect valid string input
+            if f in encoders:
+                mapper = encoders[f] # This is a list of unique values
+                if val in mapper:
+                    # Find index
+                    val = mapper.index(val)
+                else:
+                    # User entered a category not seen during training?
+                    # Fallback to -1 or 0? 
+                    # If model trained with 0..N, -1 might go down a specific path.
+                    val = -1
+            else:
+                # Assume numeric
+                val = float(val)
+            
+            input_list.append(val)
+
+        prediction = model.predict([input_list])[0]
         
         # If prediction is numpy type, convert to native python type
         if hasattr(prediction, "item"):
